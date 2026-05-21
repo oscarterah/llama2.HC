@@ -1,6 +1,3 @@
-// Inference for Llama-2 Transformer model in HolyC
-// Ported from run.c
-
 class Config {
   I32 dim;
   I32 hidden_dim;
@@ -45,7 +42,7 @@ class Transformer {
   Config config;
   TransformerWeights weights;
   RunState state;
-  F64 *w_data; // weights converted to F64
+  F64 *w_data;
 };
 
 class TokenIndex {
@@ -329,7 +326,6 @@ U0 SafePrint(U8 *piece) {
   Print("%s", piece);
 }
 
-// Fixed BSearch with correct HolyC syntax
 U8* BSearch(U8 *key, U8 *base, I64 num, I64 width, I64 (*fp_compare)(U8 *e1, U8 *e2)) {
   I64 low = 0, high = num - 1, mid, res;
   while (low <= high) {
@@ -387,7 +383,6 @@ U0 Encode(Tokenizer *t, U8 *text, I64 bos, I64 eos, I64 *tokens, I64 *n_tokens) 
     id = StrLookup(" ", t->sorted_vocab, t->vocab_size);
     if (id != -1) tokens[(*n_tokens)++] = id;
   }
-  // Simplified encoding for demonstration
   U8 *c = text;
   while (*c) {
     U8 buf[2]; buf[0] = *c; buf[1] = 0;
