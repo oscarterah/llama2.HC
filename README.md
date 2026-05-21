@@ -3,6 +3,6 @@
 To run
 
 ```
-#include "run2.HC";
+#include "run.HC";
 Llama2Run("stories15M.bin");
 ```
