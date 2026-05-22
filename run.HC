@@ -138,22 +138,22 @@ U0 MapWeights(TransformerWeights *w, Config *p, F64 *ptr, I64 shared_weights) {
   else w->wcls = ptr;
 }
 
-U0 BuildTransformer(Transformer *t, U8 *checkpoint_path) {
-  I64 i, size, num_weights, shared_weights;
+I64 BuildTransformer(Transformer *t, U8 *checkpoint_path) {
+  I64 size, num_weights, shared_weights, i;
   U8 *buf, *f32_ptr;
   Config *c_ptr;
   I64 *sz_ptr = &size;
 
   buf = FileRead(checkpoint_path, sz_ptr);
-  if (!buf) return;
+  if (!buf) return 0;
   c_ptr = &t->config;
-  MemCpy(c_ptr, buf, sizeof(Config));
+  MemCpy(c_ptr, buf, 28);
   shared_weights = t->config.vocab_size > 0;
   t->config.vocab_size = Abs(t->config.vocab_size);
 
-  num_weights = (size - sizeof(Config)) / 4;
+  num_weights = (size - 28) / 4;
   t->w_data = MAlloc(num_weights * sizeof(F64));
-  f32_ptr = buf + sizeof(Config);
+  f32_ptr = buf + 28;
   for (i = 0; i < num_weights; i++) {
     t->w_data[i] = F32ToF64(f32_ptr(U32*)[i]);
   }
@@ -161,6 +161,7 @@ U0 BuildTransformer(Transformer *t, U8 *checkpoint_path) {
 
   MapWeights(&t->weights, c_ptr, t->w_data, shared_weights);
   MallocRunState(&t->state, c_ptr);
+  return 1;
 }
 
 U0 FreeTransformer(Transformer *t) {
@@ -173,7 +174,7 @@ U0 RMSNorm(F64 *o, F64 *x, F64 *weight, I64 size) {
   F64 ss = 0.0;
   for (j = 0; j < size; j++) ss += x[j] * x[j];
   ss /= size;
-  ss += 1e-5;
+  ss += 0.00001;
   ss = 1.0 / Sqrt(ss);
   for (j = 0; j < size; j++) o[j] = weight[j] * (ss * x[j]);
 }
@@ -227,7 +228,7 @@ F64* Forward(Transformer *transformer, I64 token, I64 pos) {
 
     for (i = 0; i < dim; i += 2) {
       head_dim = i % head_size;
-      freq = 1.0 / Pow(10000.0, head_dim(F64) / head_size);
+      freq = 1.0 / Pow(10000.0, (head_dim * 1.0) / (head_size * 1.0));
       val = pos * freq;
       fcr = Cos(val); fci = Sin(val);
       if (i < kv_dim) rotn = 2; else rotn = 1;
@@ -318,11 +319,28 @@ U0 FreeTokenizer(Tokenizer *t) {
 U8* Decode(Tokenizer *t, I64 prev_token, I64 token) {
   U8 *piece = t->vocab[token];
   if (prev_token == 1 && piece[0] == ' ') piece++;
+  if (piece[0] == '<' && piece[1] == '0' && piece[2] == 'x' &&
+      piece[5] == '>' && piece[6] == 0) {
+    U8 hi = piece[3], lo = piece[4];
+    if (hi >= '0' && hi <= '9') hi -= '0';
+    else if (hi >= 'A' && hi <= 'F') hi = hi - 'A' + 10;
+    else if (hi >= 'a' && hi <= 'f') hi = hi - 'a' + 10;
+    if (lo >= '0' && lo <= '9') lo -= '0';
+    else if (lo >= 'A' && lo <= 'F') lo = lo - 'A' + 10;
+    else if (lo >= 'a' && lo <= 'f') lo = lo - 'a' + 10;
+    U8 byte_val = (hi << 4) | lo;
+    piece = t->byte_pieces + byte_val * 2;
+  }
   return piece;
 }
 
 U0 SafePrint(U8 *piece) {
+  U8 b;
   if (!piece || !piece[0]) return;
+  if (!piece[1]) {
+    b = piece[0];
+    if (!((b >= 32 && b <= 126) || b == '\n' || b == '\r' || b == '\t')) return;
+  }
   Print("%s", piece);
 }
 
@@ -340,8 +358,9 @@ U8* BSearch(U8 *key, U8 *base, I64 num, I64 width, I64 (*fp_compare)(U8 *e1, U8 
 
 U0 QuickSort(U8 *base, I64 num, I64 width, I64 (*fp_compare)(U8 *e1, U8 *e2)) {
   if (num < 2) return;
-  U8 *pivot = base + (num / 2) * width, *tmp = MAlloc(width);
+  U8 *pivot = MAlloc(width), *tmp = MAlloc(width);
   I64 i = 0, j = num - 1;
+  MemCpy(pivot, base + (num / 2) * width, width);
   while (i <= j) {
     while (fp_compare(base + i * width, pivot) < 0) i++;
     while (fp_compare(base + j * width, pivot) > 0) j--;
@@ -352,6 +371,7 @@ U0 QuickSort(U8 *base, I64 num, I64 width, I64 (*fp_compare)(U8 *e1, U8 *e2)) {
       i++; j--;
     }
   }
+  Free(pivot);
   Free(tmp);
   if (j + 1 > 1) QuickSort(base, j + 1, width, fp_compare);
   if (num - i > 1) QuickSort(base + i * width, num - i, width, fp_compare);
@@ -367,8 +387,12 @@ I64 StrLookup(U8 *str, TokenIndex *sorted_vocab, I64 vocab_size) {
 }
 
 U0 Encode(Tokenizer *t, U8 *text, I64 bos, I64 eos, I64 *tokens, I64 *n_tokens) {
-  I64 i, id;
+  I64 i, id, str_len, best_id, best_idx, n;
+  F64 best_score;
+  U8 *str_buffer, *c;
+
   if (!text) return;
+  n = 0;
   if (!t->sorted_vocab) {
     t->sorted_vocab = MAlloc(t->vocab_size * sizeof(TokenIndex));
     for (i = 0; i < t->vocab_size; i++) {
@@ -377,44 +401,99 @@ U0 Encode(Tokenizer *t, U8 *text, I64 bos, I64 eos, I64 *tokens, I64 *n_tokens) 
     }
     QuickSort(t->sorted_vocab(U8*), t->vocab_size, sizeof(TokenIndex), &CompareTokens);
   }
-  *n_tokens = 0;
-  if (bos) tokens[(*n_tokens)++] = 1;
+
+  str_buffer = MAlloc(t->max_token_length * 2 + 4);
+  str_len = 0;
+
+  if (bos) tokens[n++] = 1;
   if (text[0]) {
     id = StrLookup(" ", t->sorted_vocab, t->vocab_size);
-    if (id != -1) tokens[(*n_tokens)++] = id;
+    if (id != -1) tokens[n++] = id;
   }
-  U8 *c = text;
-  while (*c) {
-    U8 buf[2]; buf[0] = *c; buf[1] = 0;
-    id = StrLookup(buf, t->sorted_vocab, t->vocab_size);
-    if (id != -1) tokens[(*n_tokens)++] = id;
-    c++;
+
+  for (c = text; *c; c++) {
+    if ((*c & 0xC0) != 0x80) str_len = 0;
+    str_buffer[str_len++] = *c;
+    str_buffer[str_len] = 0;
+
+    if ((*(c + 1) & 0xC0) == 0x80 && str_len < 4) {
+    } else {
+      id = StrLookup(str_buffer, t->sorted_vocab, t->vocab_size);
+      if (id != -1) tokens[n++] = id;
+      else {
+        for (i = 0; i < str_len; i++) tokens[n++] = str_buffer[i] + 3;
+      }
+      str_len = 0;
+    }
   }
-  if (eos) tokens[(*n_tokens)++] = 2;
+
+  while (TRUE) {
+    best_score = -1e9;
+    best_id = -1;
+    best_idx = -1;
+
+    for (i = 0; i < (n - 1); i++) {
+      I64 len1 = StrLen(t->vocab[tokens[i]]);
+      I64 len2 = StrLen(t->vocab[tokens[i + 1]]);
+      if (len1 + len2 < t->max_token_length * 2 + 3) {
+        MemCpy(str_buffer, t->vocab[tokens[i]], len1);
+        MemCpy(str_buffer + len1, t->vocab[tokens[i + 1]], len2);
+        str_buffer[len1 + len2] = 0;
+        id = StrLookup(str_buffer, t->sorted_vocab, t->vocab_size);
+        if (id != -1 && t->vocab_scores[id] > best_score) {
+          best_score = t->vocab_scores[id];
+          best_id = id;
+          best_idx = i;
+        }
+      }
+    }
+
+    if (best_idx == -1) break;
+
+    tokens[best_idx] = best_id;
+    for (i = best_idx + 1; i < (n - 1); i++) tokens[i] = tokens[i + 1];
+    n--;
+  }
+
+  if (eos) tokens[n++] = 2;
+  *n_tokens = n;
+  Free(str_buffer);
 }
 
-I64 SampleArgmax(F64 *probabilities, I64 n) {
-  I64 i, max_i = 0;
-  F64 max_p = probabilities[0];
-  for (i = 1; i < n; i++) if (probabilities[i] > max_p) { max_i = i; max_p = probabilities[i]; }
-  return max_i;
+I64 CompareProb(U8 *e1, U8 *e2) {
+  ProbIndex *a = e1(ProbIndex*), *b = e2(ProbIndex*);
+  if (a->prob > b->prob) return -1;
+  if (a->prob < b->prob) return 1;
+  return 0;
 }
 
-U32 RandomU32(U64 *state) {
-  *state ^= *state >> 12; *state ^= *state << 25; *state ^= *state >> 27;
-  return (*state * 0x2545F4914F6CDD1D) >> 32;
-}
-
-F64 RandomF32(U64 *state) { return (RandomU32(state) >> 8) / 16777216.0; }
-
-I64 SampleMult(F64 *probabilities, I64 n, F64 coin) {
-  I64 i;
-  F64 cdf = 0.0;
+I64 SampleTopp(F64 *probabilities, I64 n, F64 topp, ProbIndex *probindex, F64 coin) {
+  I64 n0 = 0, i, last_idx;
+  F64 cutoff = (1.0 - topp) / (n - 1), cumulative_prob = 0.0, r, cdf = 0.0;
   for (i = 0; i < n; i++) {
-    cdf += probabilities[i];
-    if (coin < cdf) return i;
+    if (probabilities[i] >= cutoff) {
+      probindex[n0].index = i;
+      probindex[n0].prob = probabilities[i];
+      n0++;
+    }
   }
-  return n - 1;
+  QuickSort(probindex(U8*), n0, sizeof(ProbIndex), &CompareProb);
+
+  last_idx = n0 - 1;
+  for (i = 0; i < n0; i++) {
+    cumulative_prob += probindex[i].prob;
+    if (cumulative_prob > topp) {
+      last_idx = i;
+      break;
+    }
+  }
+
+  r = coin * cumulative_prob;
+  for (i = 0; i <= last_idx; i++) {
+    cdf += probindex[i].prob;
+    if (r < cdf) return probindex[i].index;
+  }
+  return probindex[last_idx].index;
 }
 
 I64 Sample(Sampler *sampler, F64 *logits) {
@@ -425,7 +504,8 @@ I64 Sample(Sampler *sampler, F64 *logits) {
     for (q = 0; q < sampler->vocab_size; q++) logits[q] /= sampler->temperature;
     Softmax(logits, sampler->vocab_size);
     coin = RandomF32(&sampler->rng_state);
-    next = SampleMult(logits, sampler->vocab_size, coin);
+    if (sampler->topp <= 0.0 || sampler->topp >= 1.0) next = SampleMult(logits, sampler->vocab_size, coin);
+    else next = SampleTopp(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);
   }
   return next;
 }
@@ -438,7 +518,7 @@ U0 Generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, U8
   U8 *piece;
 
   if (!prompt) prompt = "";
-  prompt_tokens = MAlloc((StrLen(prompt) + 3) * sizeof(I64));
+  prompt_tokens = MAlloc((StrLen(prompt) + 16) * sizeof(I64));
   Encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
 
   token = prompt_tokens[0];
@@ -459,10 +539,59 @@ U0 Generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, U8
   Free(prompt_tokens);
 }
 
-U0 Llama2Run(U8 *checkpoint_path, U8 *tokenizer_path="tokenizer.bin", F64 temperature=1.0, F64 topp=0.9, I64 steps=256, U8 *prompt=NULL, U64 rng_seed=0) {
+U0 Chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, U8 *cli_user_prompt, U8 *cli_system_prompt, I64 steps) {
+  U8 system_prompt[512], user_prompt[512], rendered_prompt[1152];
+  I64 num_prompt_tokens = 0, next, token, pos = 0, user_idx, user_turn = 1;
+  I64 *prompt_tokens = MAlloc(1152 * sizeof(I64));
+  F64 *logits;
+  U8 *piece;
+
+  while (pos < steps) {
+    if (user_turn) {
+      if (pos == 0) {
+        if (!cli_system_prompt) {
+          Print("Enter system prompt (optional): ");
+          GetS(system_prompt, 512);
+        } else StrCpy(system_prompt, cli_system_prompt);
+      }
+      if (pos == 0 && cli_user_prompt) StrCpy(user_prompt, cli_user_prompt);
+      else {
+        Print("User: ");
+        GetS(user_prompt, 512);
+      }
+
+      if (pos == 0 && system_prompt[0]) StrPrint(rendered_prompt, "[INST] <<SYS>>\n%s\n<</SYS>>\n\n%s [/INST]", system_prompt, user_prompt);
+      else StrPrint(rendered_prompt, "[INST] %s [/INST]", user_prompt);
+
+      Encode(tokenizer, rendered_prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+      user_idx = 0;
+      user_turn = 0;
+      Print("Assistant: ");
+    }
+
+    if (user_idx < num_prompt_tokens) token = prompt_tokens[user_idx++];
+    else token = next;
+
+    if (token == 2) user_turn = 1;
+
+    logits = Forward(transformer, token, pos);
+    next = Sample(sampler, logits);
+    pos++;
+
+    if (user_idx >= num_prompt_tokens && next != 2) {
+      piece = Decode(tokenizer, token, next);
+      SafePrint(piece);
+    }
+    if (next == 2) Print("\n");
+  }
+  Print("\n");
+  Free(prompt_tokens);
+}
+
+U0 Llama2Run(U8 *checkpoint_path, U8 *tokenizer_path="tokenizer.bin", F64 temperature=1.0, F64 topp=0.9, I64 steps=256, U8 *prompt=NULL, U8 *mode="generate", U8 *system_prompt=NULL, U64 rng_seed=0) {
   Transformer transformer; Tokenizer tokenizer; Sampler sampler;
   if (rng_seed == 0) rng_seed = Now;
-  BuildTransformer(&transformer, checkpoint_path);
+  if (!BuildTransformer(&transformer, checkpoint_path)) return;
   if (steps == 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len;
   BuildTokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
   sampler.vocab_size = transformer.config.vocab_size;
@@ -470,7 +599,10 @@ U0 Llama2Run(U8 *checkpoint_path, U8 *tokenizer_path="tokenizer.bin", F64 temper
   sampler.topp = topp;
   sampler.rng_state = rng_seed;
   sampler.probindex = MAlloc(sampler.vocab_size * sizeof(ProbIndex));
-  Generate(&transformer, &tokenizer, &sampler, prompt, steps);
+
+  if (!StrCmp(mode, "generate")) Generate(&transformer, &tokenizer, &sampler, prompt, steps);
+  else if (!StrCmp(mode, "chat")) Chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
+
   Free(sampler.probindex);
   FreeTokenizer(&tokenizer);
   FreeTransformer(&transformer);
