@@ -7,4 +7,4 @@ To run
 Llama2Run("stories15M.bin");
 ```
 
-https://github.com/user-attachments/assets/15c03a9f-27b5-4a4a-a5a6-eeed48a27a1f
+[![Watch Demo](https://img.youtube.com/vi/_IMK0Vt9zdw/maxresdefault.jpg)](https://www.youtube.com/watch?v=_IMK0Vt9zdw)
